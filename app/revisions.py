@@ -44,6 +44,19 @@
 - **容器重建**：全部状态保存在数据目录（默认 ``/data``）的单个 JSON
   文件中，采用“临时文件 + 原子替换”，进程重启/容器重建后绑定仍然
   生效，仍可读取并继续修订。
+
+多进程共享同一数据目录（两个 API 进程指向同一个 ``UNIT_API_DATA_DIR``）：
+
+- 每个 JSON 数据文件旁边有一个零字节锁文件（``...json.lock``），所有写
+  操作（创建/绑定/修订）经 ``flock(LOCK_EX)`` 跨进程互斥，读操作经
+  ``flock(LOCK_SH)`` 共享；“重读最新磁盘快照 → CAS 判定 → 两单整单重算
+  → 全量原子落盘”在跨进程与进程内同一临界区内完成；
+- 内存缓存按数据文件签名（inode/mtime/大小）失效：其他进程原子替换后
+  本进程下一次操作立即重读，一方创建/修订的工作单对另一方立即可读可改；
+  写路径总是基于重读后的全量快照落盘，旧缓存不会覆盖其他工作单；
+- 跨进程同时提交相同 ``expected_revision`` 时同样至多一笔成功，其余
+  在重算前得到带最新修订号的 409；上下游联动的两单共同提交对另一进程
+  要么整体可见、要么不可见，不存在跨进程混版。
 """
 
 from __future__ import annotations
@@ -56,6 +69,7 @@ from collections.abc import Callable
 from copy import deepcopy
 from typing import Any
 
+from . import iolock
 from .config import DATA_DIR
 from .errors import ConversionError
 from .schemas import (
@@ -148,6 +162,9 @@ class RevisionStore:
         #: 工作单标识 -> 工作单当前修订记录
         self._sheets: dict[str, dict] = {}
         self._loaded = False
+        #: 上次从磁盘读入（或成功写盘）时的数据文件签名；None 表示磁盘文件
+        #: 当时不存在。其他进程的原子替换会改变签名，据此重读最新状态。
+        self._sig: tuple[int, int, int] | None = None
 
     @property
     def path(self) -> str:
@@ -161,18 +178,27 @@ class RevisionStore:
         文件存在但无法解析时抛出异常使启动失败（宁可不可用也不静默丢数据）。
         """
 
-        with self._lock:
-            if not os.path.exists(self._path):
-                self._sheets = {}
-                self._loaded = True
-                return
+        with self._lock, iolock.locked(self._path, exclusive=False):
+            self._load_locked()
+
+    def _load_locked(self) -> None:
+        """无条件按磁盘当前内容重建内存状态（调用方须已持锁）。"""
+
+        if not os.path.exists(self._path):
+            self._sheets = {}
+        else:
             with open(self._path, encoding="utf-8") as f:
                 raw = json.load(f)
             if not isinstance(raw, dict) or raw.get("version") != _STORE_VERSION:
-                raise ValueError(f"可修订工作单存储文件版本不被支持: {self._path}")
+                raise ValueError(
+                    f"可修订工作单存储文件版本不被支持: {self._path}"
+                )
             sheets = raw.get("sheets")
             if not isinstance(sheets, dict):
-                raise ValueError(f"可修订工作单存储文件的 sheets 字段格式非法: {self._path}")
+                raise ValueError(
+                    "可修订工作单存储文件的 sheets 字段格式非法: "
+                    f"{self._path}"
+                )
             loaded: dict[str, dict] = {}
             for sheet_id, record in sheets.items():
                 loaded[sheet_id] = self._validate_record(sheet_id, record)
@@ -181,13 +207,38 @@ class RevisionStore:
             # 而不是让启动失败——该单退化为无关联工作单，仍可读取与修订。
             self._repair_dangling_bindings_locked(loaded)
             self._sheets = loaded
-            self._loaded = True
+        self._loaded = True
+        self._sig = iolock.signature(self._path)
+
+    def _sync_locked(self) -> None:
+        """与共享磁盘上的最新提交对齐内存缓存（调用方须持进程内锁）。
+
+        在跨进程锁临界区的开头调用：数据文件签名与上次读/写一致时直接复用
+        内存状态（无额外读盘）；其他进程已原子替换该文件（签名变化）时立即
+        重新加载，因此一个进程创建/修订/联动的工作单对另一进程的下一次
+        读或修订立即可见，旧缓存也绝不会被当作当前状态全量写回（其他工作
+        单不会被旧缓存覆盖）。磁盘文件不存在时：尚未加载过则按空存储启动；
+        此前已有内容则保留缓存（文件只可能被外部删除），并把签名置空，
+        待文件恢复后下一次操作重新对齐。
+        """
+
+        sig = iolock.signature(self._path)
+        if not self._loaded:
+            self._load_locked()
+            return
+        if sig == self._sig:
+            return
+        if sig is None:
+            self._sig = None
+            return
+        self._load_locked()
 
     def count(self) -> int:
         """已保存的工作单数量（主要供测试与运维观察）。"""
 
         self._ensure_loaded()
-        with self._lock:
+        with self._lock, iolock.locked(self._path, exclusive=False):
+            self._sync_locked()
             return len(self._sheets)
 
     def _repair_dangling_bindings_locked(self, sheets: dict[str, dict]) -> None:
@@ -214,11 +265,14 @@ class RevisionStore:
         """返回某工作单当前修订的**深拷贝**快照；不存在时抛出 404 领域错误。
 
         深拷贝在锁内完成：并发修改/落盘不会改动调用方拿到的对象，读者
-        看到的必然是某一修订自洽的输入与结果。
+        看到的必然是某一修订自洽的输入与结果。跨进程共享数据目录时，
+        共享读锁内先按文件签名重读其他进程的最新提交，因此另一进程创建
+        或修订后的最新修订在下一次 GET 时立即可见。
         """
 
         self._ensure_loaded()
-        with self._lock:
+        with self._lock, iolock.locked(self._path, exclusive=False):
+            self._sync_locked()
             record = self._sheets.get(worksheet_id)
             if record is None:
                 raise RevisionNotFoundError(worksheet_id)
@@ -245,7 +299,11 @@ class RevisionStore:
             "results": [_dump_result(r) for r in results],
             "binding": None,
         }
-        with self._lock:
+        with self._lock, iolock.locked(self._path, exclusive=True):
+            # 排他锁内先与其他进程的最新提交对齐：标识碰撞按合并后的现状
+            # 规避，全量落盘基于重读后的全部工作单，不会覆盖其他进程新建
+            # 的工作单。
+            self._sync_locked()
             while True:
                 sheet_id = _ID_PREFIX + secrets.token_hex(_ID_BYTES)
                 if sheet_id not in self._sheets:
@@ -291,7 +349,11 @@ class RevisionStore:
         """
 
         self._ensure_loaded()
-        with self._lock:
+        with self._lock, iolock.locked(self._path, exclusive=True):
+            # 排他锁内先重读其他进程的最新提交：上游存在性、CAS 与一对一
+            # 约束全部按磁盘最新快照判定；关联与下游随全量快照共同落盘，
+            # 跨进程并发时同样只可能有一笔成功。
+            self._sync_locked()
             upstream = self._sheets.get(upstream_id)
             if upstream is None:
                 raise RevisionNotFoundError(upstream_id)
@@ -384,7 +446,12 @@ class RevisionStore:
         """
 
         self._ensure_loaded()
-        with self._lock:
+        with self._lock, iolock.locked(self._path, exclusive=True):
+            # 跨进程排他锁内先按文件签名重读磁盘最新状态，再做 CAS：跨进程
+            # 同时提交相同 expected_revision 时，后进入者在此看到已递增的
+            # 修订号并直接 409（不重算）；全量落盘基于重读后的快照，其他
+            # 工作单（及其在其他进程里的修订）都不会被旧缓存覆盖。
+            self._sync_locked()
             record = self._sheets.get(worksheet_id)
             if record is None:
                 raise RevisionNotFoundError(worksheet_id)
@@ -683,7 +750,12 @@ class RevisionStore:
         }
 
     def _persist_locked(self) -> None:
-        """把全部工作单当前修订全量写入临时文件并原子替换（调用方须持锁）。"""
+        """把全部工作单当前修订全量写入临时文件并原子替换（调用方须持锁）。
+
+        成功后把数据文件签名更新为新文件的签名：本进程缓存即最新状态，
+        其他进程下一次进入临界区时凭签名变化重读。写盘失败时签名不更新，
+        内存回滚（见各写路径）后与磁盘仍保持一致。
+        """
 
         os.makedirs(self._data_dir, exist_ok=True)
         payload = {"version": _STORE_VERSION, "sheets": self._sheets}
@@ -693,6 +765,7 @@ class RevisionStore:
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp_path, self._path)
+        self._sig = iolock.signature(self._path)
 
 
 def _dump_body(body: WorksheetBody) -> dict:

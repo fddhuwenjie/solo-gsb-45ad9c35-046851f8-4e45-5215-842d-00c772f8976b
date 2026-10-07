@@ -39,6 +39,13 @@
   新版，不会跨版本混用；
 - 请求级换算仍构造独立的 :class:`~app.custom_units.UnitScope`，
   互不共享、不修改全局单位表。
+
+多个 API 进程可以把数据目录指向同一个共享目录：所有写路径在
+``flock(LOCK_EX)`` 跨进程排他锁内“按数据文件签名重读其他进程的最新
+提交 → 在合并后的全量快照上修改 → 原子落盘”，读路径在共享锁内对齐
+快照；因此一方发布的定义集/切换的别名对另一方的下一次操作立即可见，
+旧缓存也不会把其他进程新增的定义集覆盖掉。JSON 文件格式与单进程时代
+完全相同，锁仅存在于数据文件旁边的附加 ``*.json.lock`` 文件中。
 """
 
 from __future__ import annotations
@@ -50,6 +57,7 @@ import secrets
 import threading
 from fractions import Fraction
 
+from . import iolock
 from .config import DATA_DIR
 from .custom_units import CustomUnitSpec, UnitScope
 from .errors import AliasConflictError, ConversionError
@@ -165,6 +173,9 @@ class UnitSetStore:
         #: 活动别名 -> 当前指向的定义集标识（不可变定义集的引用）
         self._aliases: dict[str, str] = {}
         self._loaded = False
+        #: 上次从磁盘读入（或成功写盘）时的数据文件签名；None 表示磁盘文件
+        #: 当时不存在。其他进程的原子替换会改变签名，据此重读最新状态。
+        self._sig: tuple[int, int, int] | None = None
 
     @property
     def path(self) -> str:
@@ -180,16 +191,22 @@ class UnitSetStore:
         定义集照常可用（向前兼容）。
         """
 
-        with self._lock:
-            if not os.path.exists(self._path):
-                self._sets = {}
-                self._aliases = {}
-                self._loaded = True
-                return
+        with self._lock, iolock.locked(self._path, exclusive=False):
+            self._load_locked()
+
+    def _load_locked(self) -> None:
+        """无条件按磁盘当前内容重建内存状态（调用方须已持锁）。"""
+
+        if not os.path.exists(self._path):
+            self._sets = {}
+            self._aliases = {}
+        else:
             with open(self._path, encoding="utf-8") as f:
                 raw = json.load(f)
             if not isinstance(raw, dict) or raw.get("version") != _STORE_VERSION:
-                raise ValueError(f"自定义单位定义集存储文件版本不被支持: {self._path}")
+                raise ValueError(
+                    f"自定义单位定义集存储文件版本不被支持: {self._path}"
+                )
             sets: dict[str, tuple[CustomUnitItem, ...]] = {}
             for set_id, items in raw.get("sets", {}).items():
                 sets[set_id] = tuple(
@@ -201,16 +218,41 @@ class UnitSetStore:
                 for name, target in aliases_raw.items()
             ):
                 raise ValueError(
-                    f"自定义单位定义集存储文件的 aliases 字段格式非法: {self._path}"
+                    "自定义单位定义集存储文件的 aliases 字段格式非法: "
+                    f"{self._path}"
                 )
             # 只保留指向已存在定义集的别名：定义集不可删除，正常情况下不会
             # 出现悬空引用；若文件被外部破坏则丢弃悬空项而非启动失败。
-            aliases = {
-                name: target for name, target in aliases_raw.items() if target in sets
-            }
             self._sets = sets
-            self._aliases = aliases
-            self._loaded = True
+            self._aliases = {
+                name: target
+                for name, target in aliases_raw.items()
+                if target in sets
+            }
+        self._loaded = True
+        self._sig = iolock.signature(self._path)
+
+    def _sync_locked(self) -> None:
+        """与共享磁盘上的最新提交对齐内存缓存（调用方须持进程内锁）。
+
+        在跨进程锁临界区的开头调用：数据文件签名与上次读/写一致时直接复用
+        内存状态（无额外读盘）；其他进程已原子替换该文件（签名变化）时立即
+        重新加载，因此一个进程发布的定义集、切换的别名对另一进程的下一次
+        操作立即可见，旧缓存也不会被当作当前状态写回。磁盘文件不存在时：
+        尚未加载过则按空存储启动；此前已有内容则保留缓存（文件只可能被
+        外部删除），并把签名置空，待文件恢复后下一次操作重新对齐。
+        """
+
+        sig = iolock.signature(self._path)
+        if not self._loaded:
+            self._load_locked()
+            return
+        if sig == self._sig:
+            return
+        if sig is None:
+            self._sig = None
+            return
+        self._load_locked()
 
     def publish(self, items: list[CustomUnitItem]) -> str:
         """先按现有规则校验并展开全部条目，通过后发布并返回服务生成的标识。
@@ -232,7 +274,10 @@ class UnitSetStore:
         # 构造期间立即解析全部声明；非法即抛 422，发生在任何写入之前
         UnitScope(specs)
 
-        with self._lock:
+        with self._lock, iolock.locked(self._path, exclusive=True):
+            # 排他锁内先与其他进程的最新提交对齐，再在合并后的状态上生成标识：
+            # 全量写盘基于重读后的快照，绝不会用本进程的旧缓存覆盖其他定义集。
+            self._sync_locked()
             while True:
                 set_id = _ID_PREFIX + secrets.token_hex(_ID_BYTES)
                 if set_id not in self._sets:
@@ -245,7 +290,9 @@ class UnitSetStore:
         """取已发布的定义项；不存在时抛出 :class:`ConversionError`（422）。"""
 
         self._ensure_loaded()
-        with self._lock:
+        with self._lock, iolock.locked(self._path, exclusive=False):
+            # 共享锁内对齐其他进程的最新发布；定义集不可变，读到即长期有效。
+            self._sync_locked()
             items = self._sets.get(set_id)
         if items is None:
             raise unit_set_not_found(set_id)
@@ -271,14 +318,16 @@ class UnitSetStore:
         """返回全部活动别名及其当前指向（按别名排序的副本）。"""
 
         self._ensure_loaded()
-        with self._lock:
+        with self._lock, iolock.locked(self._path, exclusive=False):
+            self._sync_locked()
             return dict(sorted(self._aliases.items()))
 
     def get_alias(self, alias: str) -> str:
         """查询别名当前指向的定义集标识；别名不存在时抛出 422。"""
 
         self._ensure_loaded()
-        with self._lock:
+        with self._lock, iolock.locked(self._path, exclusive=False):
+            self._sync_locked()
             target = self._aliases.get(alias)
         if target is None:
             raise alias_not_found(alias)
@@ -299,7 +348,10 @@ class UnitSetStore:
         self._ensure_loaded()
         if not ALIAS_NAME_RE.match(alias):
             raise invalid_alias_name(alias)
-        with self._lock:
+        with self._lock, iolock.locked(self._path, exclusive=True):
+            # 排他锁内先重读其他进程的最新提交，再判定 CAS：跨进程并发切换
+            # 同样最多一项成功，且全量落盘基于合并后的最新快照。
+            self._sync_locked()
             # 目标必须存在；先于 CAS 判定（任何情况下都不得改写原指向）
             if target_set_id not in self._sets:
                 raise alias_target_not_found(alias, target_set_id)
@@ -337,7 +389,8 @@ class UnitSetStore:
         """已发布的定义集数量（主要供测试与运维观察）。"""
 
         self._ensure_loaded()
-        with self._lock:
+        with self._lock, iolock.locked(self._path, exclusive=False):
+            self._sync_locked()
             return len(self._sets)
 
     # -- 实例间迁移包 -----------------------------------------------------
@@ -370,7 +423,10 @@ class UnitSetStore:
                 raise export_duplicate_selection(set_id)
             seen.add(set_id)
             ordered.append(set_id)
-        with self._lock:
+        with self._lock, iolock.locked(self._path, exclusive=False):
+            # 共享锁内对齐其他进程的最新提交；存在性校验与别名筛选在同一份
+            # 磁盘快照上完成，跨进程并发切换别名也不会跨快照拼装。
+            self._sync_locked()
             for set_id in ordered:
                 if set_id not in self._sets:
                     raise unit_set_not_found(set_id)
@@ -433,7 +489,11 @@ class UnitSetStore:
             if target not in validated:
                 raise package_dangling_alias(alias, target)
 
-        with self._lock:
+        with self._lock, iolock.locked(self._path, exclusive=True):
+            # 排他锁内先与其他进程的最新提交对齐：同名别名冲突按合并后的
+            # 现状判定，标识生成避开其他进程的新标识，全量落盘保留全部
+            # 既有内容（纯增量），旧缓存不会覆盖其他进程的提交。
+            self._sync_locked()
             # 同名别名冲突在锁内判定：整包拒绝，不写入任何内容
             for alias in aliases:
                 if alias in self._aliases:
@@ -476,7 +536,12 @@ class UnitSetStore:
             self.load()
 
     def _persist_locked(self) -> None:
-        """把当前定义集与别名全量写入临时文件并原子替换（调用方须持锁）。"""
+        """把当前定义集与别名全量写入临时文件并原子替换（调用方须持锁）。
+
+        成功后把数据文件签名更新为新文件的签名：本进程缓存即最新状态，
+        其他进程下一次进入临界区时凭签名变化重读。写盘失败时签名不更新，
+        内存回滚后与磁盘仍保持一致（见各写路径的回滚逻辑）。
+        """
 
         os.makedirs(self._data_dir, exist_ok=True)
         payload = {
@@ -500,6 +565,7 @@ class UnitSetStore:
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp_path, self._path)
+        self._sig = iolock.signature(self._path)
 
 
 #: 进程内共享的存储单例；由应用启动时初始化（也可在测试中重新初始化）。

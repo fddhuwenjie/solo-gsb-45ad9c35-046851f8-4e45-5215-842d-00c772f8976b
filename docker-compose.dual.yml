@@ -1,0 +1,30 @@
+# 可选的双进程（双 API 实例共享同一数据目录）叠加配置。
+#
+# 原启动方式完全不变：
+#   docker compose up --build            # 仅 api（8000）
+#
+# 需要两个进程共享同一份可修订工作单与已发布定义集时叠加本文件：
+#   docker compose -f docker-compose.yml -f docker-compose.dual.yml up --build
+#   # api        -> http://localhost:8000
+#   # api-peer   -> http://localhost:8001
+#
+# 两个容器把同一个命名卷挂载到各自的 UNIT_API_DATA_DIR：定义集与工作单
+# 仍是目录下的原有 JSON 文件（custom_unit_sets.json /
+# revisable_worksheets.json），跨进程互斥由数据文件旁边的 flock 锁文件
+# 保证（见 app/iolock.py），不依赖额外服务。单实例时本文件不生效，命名卷、
+# 环境变量与启动命令均保持原样。
+services:
+  api-peer:
+    build: .
+    image: unit-convert-api
+    depends_on:
+      - api
+    ports:
+      # 第二个实例对宿主机暴露 8001；容器内仍监听 8000
+      - "${UNIT_API_PEER_PORT:-8001}:8000"
+    environment:
+      UNIT_API_DATA_DIR: /data
+    volumes:
+      # 与 api 同一个命名卷：两个进程共享同一数据目录
+      - unit_sets_data:/data
+    restart: unless-stopped

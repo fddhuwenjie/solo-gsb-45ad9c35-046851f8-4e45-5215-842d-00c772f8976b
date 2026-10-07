@@ -12,6 +12,7 @@
 - **顺序计算工作单（`POST /worksheet`）**：一次请求提交初始带单位变量与 **2～5 个步骤**，每步要么是公式求值、要么是一次线性方程反求，给出唯一结果名与目标单位；后续步骤可按结果名引用先前步骤的结果，步骤间传递**精确分数数值与绝对温度属性**，返回各步骤的 `value`/`unit`/`dimension` 供核对完整过程；任一步错误返回 **422 且不返回部分结果**
 - **可修订工作单（`POST`/`GET`/`PATCH /revisable-worksheets`）**：把一份 2～5 步工作单连同**已发布定义集标识或活动别名**创建为可反复调整的持久化工作单。整单计算成功才保存输入、逐步结果、实际使用的定义集标识与初始修订号（`revision=1`）；按标识读取当前内容、结果与修订号；修订时必须携带**预期修订号**，每次只能替换一个初始变量的值与单位、或一个现有步骤（按结果名定位、名称不变）的公式/方程及目标单位，随后**整单重算**并共同保存新输入、新逐步结果与递增修订号（下游步骤不沿用旧结果）。同一修订的并发修改最多一项成功，其余返回 **409**；计算失败返回 **422**、写盘失败回滚，二者都不改变已保存内容；别名切换后仍使用创建时固定的定义；并发读取只见同一修订的输入与结果；**容器重建后仍可读取并继续修订**
 - **步骤结果绑定（`POST /revisable-worksheets/{id}/bindings`）**：把一张**上游**可修订工作单的某个步骤结果绑定为新创建的**下游**工作单的同名初始变量。请求提交上游标识（路径参数）、步骤名、上游 `expected_revision` 与含同名绑定变量的下游工作单；以该步骤结果的**值和单位整体覆盖**该变量，下游整单计算成功才共同保存关联与下游（201），返回下游标识、上下游两单修订号与逐步结果。两单固定**同一份已发布定义集**（下游沿用上游创建时固定的标识），仅允许**一对一**关联、**不允许链式**关联。此后沿用 `PATCH /revisable-worksheets/{id}` 修订上游时，绑定变量自动以新步骤结果覆盖并**整单重算下游**，两单的输入、结果与修订号在同一临界区共同落盘；下游计算失败（**422**）或写盘失败时两单都不改变，并发读取不会见到混版。下游仍可修改其他变量或步骤，但直接修改绑定变量返回 **422**；上游不存在返回 **404**、上游修订号过期返回带当前号的 **409**。读取下游可见上游标识、步骤及对应修订号；**容器重建后关联仍生效**；无关联工作单行为不变
+- **多进程共享同一数据目录**：可以启动两个（或更多）API 进程并把 `UNIT_API_DATA_DIR` 指向同一个共享目录（见 [“双进程共享数据目录”](#双进程共享数据目录可选)）。两进程共用目录下**事先发布的同一份单位定义集**与原有 JSON 存档；一方创建的工作单另一方**立即**能读取与修订。跨进程同时提交相同 `expected_revision` 时由文件锁串行化：至多一笔成功，其余返回带最新修订号的 **409**，且全量落盘总基于重读后的合并快照，**旧缓存不会覆盖其他工作单**。上下游绑定/上游修订在跨进程临界区内联动，任一进程读取两单都得到配套的输入、逐步结果与关联修订号；下游重算失败（**422**）或落盘失败时两单保持原样。无关联工作单与所有原有 HTTP 请求/响应行为不变
 
 - **工作单换版诊断（`POST /worksheet-diagnose`）**：一次请求提交同一份 2～5 步工作单与旧、新两份**已发布**定义集的标识或活动别名；请求开始时分别固定两侧实际指向，用各自定义各执行一遍（只读、不改定义集或别名），逐步并排返回两侧结果与**首个含义变化**。比较按 **SI 口径精确分数数值、量纲与绝对温度属性**进行，而非显示字符串——旧版 `span=2 m`、新版 `span=3 m` 时输入 `1 span` 并输出到 `span`，两侧虽都显示 `1 span` 也会报告物理值已变。某一侧第 k 步业务失败时保留此前步骤对照并回报该步错误，失败后步骤标记 `not_run` 不计成功；未知定义集/别名或非法请求返回 422
 - **工作单输入迁移（`POST /worksheet-migrate`）**：一次请求提交现有 2～5 步工作单与旧、新定义集标识或活动别名（请求开始分别固定两侧实际指向）；先在旧定义下执行，再把每个初始变量改写成**新定义下单位表达式相同、物理量（含量纲与绝对温度属性）也相同的精确十进制值**，返回可直接交给 `/worksheet` 的新工作单（引用固定的新定义集标识）。改写后整张工作单在新定义下再执行一遍，逐步核对内部精确量、量纲与绝对温度属性（显示值允许变化）；旧工作单出错、新定义下变量或步骤单位不兼容、改写值无法精确十进制表示、新工作单出错或结果含义变化时返回 **422 并指出变量或步骤**，不返回迁移工作单。操作只读，不改写定义集或别名
@@ -37,6 +38,38 @@ docker compose up --build
 
 - API 文档（Swagger UI）：http://localhost:8000/docs
 - 健康检查：http://localhost:8000/health
+
+#### 双进程共享数据目录（可选）
+
+需要两个 API 进程共享同一份已发布定义集与可修订工作单时（原启动命令
+保持可用，不受影响），叠加 `docker-compose.dual.yml`：
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.dual.yml up --build
+```
+
+此时同一容器网络外暴露两个端口、两个进程共享同一个命名卷（`/data`）：
+
+- 进程 A：http://localhost:8000
+- 进程 B：http://localhost:8001（可用 `UNIT_API_PEER_PORT` 覆盖）
+
+共享目录里仍是原来的两个 JSON 文件（`custom_unit_sets.json`、
+`revisable_worksheets.json`）；跨进程互斥由各自数据文件旁边的零字节
+`flock` 锁文件（`*.json.lock`）实现，不引入额外服务。只想回到单进程时
+照旧执行 `docker compose up --build`（不带叠加文件），数据格式完全相同。
+
+本地（无 Docker）起两个共享目录的进程：
+
+```bash
+mkdir -p ./shared-data
+UNIT_API_DATA_DIR=$PWD/shared-data \
+  uvicorn app.main:app --host 127.0.0.1 --port 8000 &
+UNIT_API_DATA_DIR=$PWD/shared-data \
+  uvicorn app.main:app --host 127.0.0.1 --port 8001 &
+```
+
+操作示例（端口 8000/8001 混用即可）与并发/绑定语义见下文
+[“双进程共享数据目录”](#双进程共享数据目录可选) 一节。
 
 ### 仅 Docker
 
@@ -1347,6 +1380,148 @@ curl http://localhost:8000/revisable-worksheets/rws_DOWN
 - 绑定只发生在两张**可修订工作单**之间；`POST /worksheet` 等无状态接口
   与没有关联的工作单行为完全不变。
 
+### 双进程共享数据目录（可选）
+
+两个 API 进程可以把 `UNIT_API_DATA_DIR` 指向**同一个共享目录**（Docker
+用法见[快速开始](#双进程共享数据目录可选)）：目录里仍是原有的
+`custom_unit_sets.json` 与 `revisable_worksheets.json`，文件格式与单
+进程完全一致；跨进程互斥由 `flock` 锁文件（数据文件旁边的零字节
+`*.json.lock`，自动创建、随用随取、不属于 JSON 存档）保证。下面所有
+示例在两个端口（A=`:8000`、B=`:8001`）之间混用。
+
+**1）事先发布同一份单位定义集，两进程共用**
+
+```bash
+# 在进程 A 发布；进程 B 无需重新发布，直接按同一标识使用
+curl -X POST http://localhost:8000/custom-unit-sets \
+  -H 'Content-Type: application/json' \
+  -d '{"custom_units":[{"symbol":"ft","factor":"0.3048","base_unit":"m"}]}'
+# -> {"id":"cus_SHARED", ...}
+
+curl -X POST http://localhost:8001/convert \
+  -H 'Content-Type: application/json' \
+  -d '{"value":"10","from":"ft","to":"m","custom_unit_set_id":"cus_SHARED"}'
+# {"value":"3.048","unit":"m","dimension":"m"}
+```
+
+**2）一方创建的工作单，另一方立即可读、可修订**
+
+```bash
+# 进程 A 创建
+curl -X POST http://localhost:8000/revisable-worksheets \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "variables": {"v": {"value": "60", "unit": "km/h"},
+                  "t": {"value": "2",  "unit": "h"}},
+    "steps": [
+      {"name": "s",  "formula": "v*t", "output_unit": "km"},
+      {"name": "th", "equation": "v*th = s", "solve_for": "th", "output_unit": "h"}
+    ],
+    "custom_unit_set_id": "cus_SHARED"
+  }'
+# -> {"id":"rws_ONE", "revision": 1, ...}
+
+# 进程 B 立刻 GET（无需重启、无延迟）
+curl http://localhost:8001/revisable-worksheets/rws_ONE
+# -> {"id":"rws_ONE", "revision": 1, "results":[{"name":"s","value":"120", ...}, ...]}
+
+# 进程 B 直接修订 A 创建的工作单；再回到进程 A 读到的是 revision=2
+curl -X PATCH http://localhost:8001/revisable-worksheets/rws_ONE \
+  -H 'Content-Type: application/json' \
+  -d '{"expected_revision": 1,
+       "variable": {"name": "t", "value": "3", "unit": "h"}}'
+# -> 200 {"revision": 2, "results":[{"name":"s","value":"180", ...}, ...]}
+```
+
+**3）跨进程并发提交相同 `expected_revision`：至多一笔成功**
+
+两个进程都基于自己读到的 `revision=2` 同时提交（下面用 `&` 制造交叠）：
+
+```bash
+curl -sS -o /tmp/a.json -w 'A: %{http_code}\n' -X PATCH \
+  http://localhost:8000/revisable-worksheets/rws_ONE \
+  -H 'Content-Type: application/json' \
+  -d '{"expected_revision": 2, "variable": {"name": "t", "value": "4", "unit": "h"}}' &
+curl -sS -o /tmp/b.json -w 'B: %{http_code}\n' -X PATCH \
+  http://localhost:8001/revisable-worksheets/rws_ONE \
+  -H 'Content-Type: application/json' \
+  -d '{"expected_revision": 2, "variable": {"name": "t", "value": "5", "unit": "h"}}' &
+wait
+# A: 200
+# B: 409   （顺序可能互换；409 的详情在 /tmp/a.json 或 /tmp/b.json 中）
+cat /tmp/b.json
+# {"detail":{"error":"revision_conflict",
+#   "message":"工作单 'rws_ONE' 当前修订号为 3，提交的 expected_revision 为 2：……",
+#   "current_revision": 3}}
+```
+
+- 文件锁把跨进程的“重读最新快照 → CAS 判定 → 整单重算 → 全量原子落盘”
+  串行化，落选方在**任何重算之前**就拿到 409，响应体的
+  `current_revision` 是最新修订号；调用方按它重新 GET 后重试即可；
+- 每次落盘都是**重读后的全量合并快照**：即使某进程的内存缓存停留在旧
+  修订，它也不会把其他进程创建/修订的**其他工作单**覆盖回旧内容
+  （“旧缓存覆盖”在跨进程下同样不可能发生）。
+
+**4）跨进程上下游绑定：任一进程读取两单都配套**
+
+上一步并发提交后上游 `rws_ONE` 已是 `revision=3`（绑定前先 GET 一次取得
+当前修订号与步骤结果即可；下面以当前 `revision=3`、步骤 `s=240 km`
+为例继续）。
+
+```bash
+# 上游 rws_ONE 在进程 A 创建、在第 3）步被修订到 revision=3；
+# 在进程 B 上基于 revision=3 建立下游（绑定步骤 s）
+curl -X POST http://localhost:8001/revisable-worksheets/rws_ONE/bindings \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "step_name": "s",
+    "expected_revision": 3,
+    "variables": {"s": {"value": "0", "unit": "h"},
+                  "k": {"value": "2", "unit": "1"}},
+    "steps": [
+      {"name": "half",  "formula": "s/2",    "output_unit": "km"},
+      {"name": "again", "formula": "half*k", "output_unit": "km"}
+    ]
+  }'
+# -> 201 {"id":"rws_TWO", "revision": 1,
+#         "binding": {"upstream_worksheet_id": "rws_ONE",
+#                     "step_name": "s", "upstream_revision": 3}, ...}
+
+# 在进程 A 修订上游（4 h -> 5 h，s=300 km）；两单在同一个跨进程临界区内
+# 整单重算并共同落盘
+curl -X PATCH http://localhost:8000/revisable-worksheets/rws_ONE \
+  -H 'Content-Type: application/json' \
+  -d '{"expected_revision": 3,
+       "variable": {"name": "t", "value": "5", "unit": "h"}}'
+# -> 200 revision=4，s=300 km
+
+# 两个进程分别读上游与下游，得到完全配套的输入、逐步结果与关联修订号
+curl http://localhost:8001/revisable-worksheets/rws_TWO |
+  python3 -c 'import json,sys; d=json.load(sys.stdin); \
+    print(d["revision"], d["variables"]["s"], d["binding"])'
+# 4 {'value': '300', 'unit': 'km'} {'upstream_worksheet_id': 'rws_ONE',
+#  'step_name': 's', 'upstream_revision': 4}
+```
+
+- 若联动时**下游**整单重算任一步失败（如新绑定值与下游步骤量纲不兼容），
+  返回 **422**，发生在任何写入之前——两个进程随后 GET 上游与下游都仍是
+  原修订，可用上游原修订号重试；
+- **落盘失败**时两单内存与磁盘状态共同回滚，任一单都不会被单独改变；
+- 下游直接 PATCH 绑定变量仍返回 **422**；一对一、非链式约束跨进程同样
+  生效；没有关联的工作单在两进程间照常创建、读取与修订，响应不含
+  `binding` 字段，与单进程完全一致。
+
+**存储与并发实现要点**
+
+- 两个 JSON 文件格式、字段与单进程时代完全相同，已有的单进程存档可直接
+  放到共享目录由两个进程加载；`*.json.lock` 是数据文件之外的附加锁文件
+  （删除无副作用，会自动重建）；
+- 进程用数据文件签名（inode、mtime 纳秒、大小）判断其他进程是否已原子
+  替换文件：签名未变不读盘，签名一变下一次操作立即重载——因此一方的
+  提交对另一方的**下一次操作**立即可见；
+- 写操作取 `flock` 排他锁、读操作取共享锁；同进程多线程另由各自的可重入
+  锁串行化内存缓存。锁仅在单次操作期间持有，请求之间不保留。
+
 ### 其他端点
 
 | 端点         | 说明                             |
@@ -1492,12 +1667,13 @@ app/
   evaluator.py  # 公式求值器（Fraction 数值/量纲合并、温标规则）
   solver.py     # 等式求解器（未知量一次系数/常数的 Fraction 构建与量纲校验）
   worksheet.py  # 顺序计算工作单：2～5 个求值/反求步骤顺序执行，步骤间传递精确量与绝对温度属性；另有逐步收集器（不抛业务错误）供换版诊断与输入迁移使用
-  revisions.py  # 可修订工作单：创建/读取/乐观修订（CAS）、单项目替换、整单重算、修订号递增与 JSON 原子落盘/重载（容器重建后可继续修订）；步骤结果绑定：下游创建（一对一/非链式校验、绑定变量覆盖、下游整单成功才共同落盘）与上游修订联动（同一临界区两单重算与共同落盘/回滚）、绑定信息持久化与悬空修复
+  revisions.py  # 可修订工作单：创建/读取/乐观修订（CAS）、单项目替换、整单重算、修订号递增与 JSON 原子落盘/重载（容器重建后可继续修订）；步骤结果绑定：下游创建（一对一/非链式校验、绑定变量覆盖、下游整单成功才共同落盘）与上游修订联动（同一临界区两单重算与共同落盘/回滚）、绑定信息持久化与悬空修复；多进程共享数据目录：flock 跨进程读写锁 + 文件签名失效重读
+  iolock.py     # 跨进程文件锁（fcntl.flock 共享/排他）与数据文件签名（inode/mtime/大小），供两个存储在共享数据目录上做跨进程互斥与缓存失效
   diagnose.py   # 工作单换版诊断：开始时固定旧/新定义集指向，两侧各执行同一工作单，按内部精确数值/量纲/绝对温度属性逐步比较并定位首个含义变化
   migrate.py    # 工作单输入迁移：旧定义下执行后把初始变量改写为新定义下物理量相同的精确十进制值，复核整张新工作单并返回可直接交给 /worksheet 的结果
   units.py      # 单位注册表、SI 词头与别名
   custom_units.py  # 请求级自定义单位（custom_units）：冲突/循环/禁引校验与链式解析，三种来源选择
-  unit_sets.py  # 已发布定义集与活动别名：校验发布、标识生成、别名乐观切换（CAS）、迁移包导出（同快照）/整包导入（新标识+别名改指+共同落盘）、线程安全与 JSON 落盘/重载
+  unit_sets.py  # 已发布定义集与活动别名：校验发布、标识生成、别名乐观切换（CAS）、迁移包导出（同快照）/整包导入（新标识+别名改指+共同落盘）、线程安全与 JSON 落盘/重载；多进程共享数据目录：flock 跨进程读写锁 + 文件签名失效重读
   converter.py  # 量纲校验、仿射规则与精确十进制换算
   errors.py     # 领域错误（换算类统一映射 422；别名冲突 AliasConflictError 映射 409）
   config.py     # 精度/幂次上限/数据目录配置
@@ -1510,9 +1686,12 @@ tests/
   test_worksheet_migrate.py # /worksheet-migrate 输入迁移（改写变量/往返提交/别名固定/各类 422 指出变量或步骤）端到端测试
   test_revisable_worksheets.py # 可修订工作单创建/读取/修订（单项目替换/整单重算/下游不沿用旧结果/409 CAS/404/422/别名固定/重建后续修订/写盘回滚/一致读）端到端测试
   test_step_result_bindings.py # 步骤结果绑定（建立关联/覆盖与同定义集/读取 binding/一对一与非链式/404/409/422/上游修订联动两单共同落盘/下游失败与写盘失败两单回滚/并发只联动一次/下游自治与绑定变量保护/重建后关联仍生效/旧文件兼容）端到端测试
+  test_shared_dir_multiprocess.py # 双进程共享数据目录（存储级确定性）：事先发布定义集跨进程可见/工作单跨进程立即可读可改/相同 expected_revision 跨进程至多一笔成功（余 409 带最新号）/旧缓存不覆盖其他工作单/跨进程绑定与联动两单配套/下游失败两单原样/JSON 存档格式不变与锁文件附加/无关联工作单照常
+  test_dual_process_http.py # 真实双 uvicorn 进程（共享 UNIT_API_DATA_DIR）端到端 HTTP 定向验证：跨进程发布/创建/读取/修订、并发 409、上下游绑定联动、失败两单不变（设 UNIT_API_RUN_DUAL_PROCESS_TESTS=1 启用）
   test_custom_units.py  # 请求级自定义单位（四个接口）端到端测试
   test_unit_sets.py     # 可复用定义集发布/选用/互斥/隔离/不可变/持久化测试
   test_unit_set_aliases.py  # 活动别名查询/切换（409/422）/四接口选用/并发一致性/持久化与旧文件兼容测试
 Dockerfile
 docker-compose.yml  # 命名卷 unit_sets_data -> /data，持久化已发布定义集、活动别名与可修订工作单
+docker-compose.dual.yml  # 可选叠加配置：再启动一个 api-peer（宿主 8001）与 api 共享同一命名卷，两进程共享数据目录；不叠加时启动方式与以前完全一致
 ```

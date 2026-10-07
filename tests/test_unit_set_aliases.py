@@ -365,7 +365,7 @@ def test_concurrent_switch_and_compute_never_mixes_versions():
     store = unit_sets.get_store()
     store.bind_alias("live", sid_v1, None)
 
-    def compute(_):
+    def compute():
         r = client.post(
             "/convert",
             json={
@@ -376,20 +376,26 @@ def test_concurrent_switch_and_compute_never_mixes_versions():
         assert r.status_code == 200, r.text
         return r.json()["value"]
 
-    def switch(_):
+    # 切换前先确定性地完成一笔，保证旧版结果 2 至少出现一次（不依赖线程
+    # 调度时序）
+    assert compute() == "2"
+
+    def switch():
         # 409（与并发切换竞争）是允许的；成功与否都不得影响计算一致性
         return store.bind_alias("live", sid_v2, sid_v1)
 
+    # 切换与一批计算真正交叠；交叠期间的值只允许是旧版 2 或新版 3
     with ThreadPoolExecutor(8) as pool:
-        futs = [pool.submit(compute, i) for i in range(100)]
-        sf = pool.submit(switch, 0)
+        sf = pool.submit(switch)
+        futs = [pool.submit(compute) for _ in range(100)]
         values = [f.result() for f in futs]
         sf.result()
 
+    # 切换已完成后再确定性地完成一笔，保证新版结果 3 至少出现一次
+    assert compute() == "3"
+
     # 每次结果只能是旧版 2 或新版 3——不可能出现跨版本的其他值
     assert set(values) <= {"2", "3"}
-    assert "2" in values  # 切换前必然有请求完成
-    assert "3" in values  # 切换后必然有请求完成
 
 
 def test_concurrent_conflicting_binds_only_one_succeeds():
@@ -454,7 +460,8 @@ def test_switch_persists_and_survives_reinitialization():
 
 def test_old_file_without_aliases_field_loads_sets_normally(tmp_path):
     data_dir = tmp_path / "data"
-    data_dir.mkdir(parents=True)
+    # 存储初始化（跨进程锁文件）可能已预建数据目录，exist_ok 兼容两种时序
+    data_dir.mkdir(parents=True, exist_ok=True)
     # 先用现有存储发布一个定义集，再手工删掉 aliases 字段模拟旧文件
     old = unit_sets.UnitSetStore(str(data_dir))
     old.load()
