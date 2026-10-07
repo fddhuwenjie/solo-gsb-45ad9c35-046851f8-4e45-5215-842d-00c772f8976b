@@ -22,5 +22,8 @@ def _isolated_stores(tmp_path):
     revision_store.load()
     revisions._store = revision_store
     yield store
+    # 显式关闭每用例独立数据目录上的 flock 文件描述符，避免跨用例泄漏
+    store.close()
+    revision_store.close()
     unit_sets._store = None
     revisions._store = None

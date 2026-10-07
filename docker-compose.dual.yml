@@ -1,0 +1,44 @@
+# 可选的双进程运行配置：两个 API 进程（api-a / api-b）使用同一镜像，
+# 挂载同一个命名卷 unit_sets_data——与默认 docker-compose.yml 在同一目录
+# 下声明的卷同名（默认 project 名即目录名，因此两个文件解析出的是同一个
+# 底层卷）：事先由单实例（docker compose up --build）发布到该卷的定义集与
+# 工作单，两个进程启动后即可共同使用。
+#
+# 互斥与缓存同步由应用在数据文件旁的 flock 锁完成（见 app/locking.py），
+# 两个进程各自开放一个主机端口：
+#
+#   docker compose -f docker-compose.dual.yml up --build
+#   # api-a -> http://localhost:8000   api-b -> http://localhost:8001
+#
+# 主机端口可用 UNIT_API_PORT_A / UNIT_API_PORT_B 覆盖。
+# 若以 -p 指定了不同的 project 名，同名卷会按 project 名隔离；需要跨
+# project 共享时请把 unit_sets_data 声明为 external 卷并先手工创建。
+#
+# 原有单进程启动命令保持不变：
+#   docker compose up --build
+
+services:
+  api-a:
+    build: .
+    image: unit-convert-api
+    ports:
+      - "${UNIT_API_PORT_A:-8000}:8000"
+    environment:
+      UNIT_API_DATA_DIR: /data
+    volumes:
+      - unit_sets_data:/data
+    restart: unless-stopped
+
+  api-b:
+    build: .
+    image: unit-convert-api
+    ports:
+      - "${UNIT_API_PORT_B:-8001}:8000"
+    environment:
+      UNIT_API_DATA_DIR: /data
+    volumes:
+      - unit_sets_data:/data
+    restart: unless-stopped
+
+volumes:
+  unit_sets_data:

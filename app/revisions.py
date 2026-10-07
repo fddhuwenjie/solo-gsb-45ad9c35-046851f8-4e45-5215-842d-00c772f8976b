@@ -43,7 +43,15 @@
   保存的输入、结果或修订号；
 - **容器重建**：全部状态保存在数据目录（默认 ``/data``）的单个 JSON
   文件中，采用“临时文件 + 原子替换”，进程重启/容器重建后绑定仍然
-  生效，仍可读取并继续修订。
+  生效，仍可读取并继续修订；
+- **多进程共享数据目录**：两个 API 进程可把数据目录指向同一个共享卷
+  （见 ``docker-compose.dual.yml``）。每次创建/读取/修订/绑定都在数据
+  文件旁的 ``flock`` 锁（``.revisable_worksheets.json.lock``）上进行：
+  写事务持排他锁、进入后先按磁盘签名（inode+mtime+大小）重载其他进程
+  的最新修订再修改并原子落盘，因此一方创建的工作单另一方下一次读取
+  立即可见、跨进程同时提交同一 ``expected_revision`` 至多一笔成功
+  （其余 409 且带回最新修订号），落盘内容始终基于最新磁盘版本，其他
+  工作单不会被旧缓存覆盖。
 """
 
 from __future__ import annotations
@@ -58,6 +66,7 @@ from typing import Any
 
 from .config import DATA_DIR
 from .errors import ConversionError
+from .locking import FileLock, file_signature
 from .schemas import (
     WorksheetBody,
     WorksheetRequest,
@@ -144,10 +153,17 @@ class RevisionStore:
     def __init__(self, data_dir: str = DATA_DIR) -> None:
         self._data_dir = data_dir
         self._path = os.path.join(data_dir, STORE_FILENAME)
-        self._lock = threading.RLock()
+        # 进程内可重入锁串行化同进程线程；self._file_lock（flock）跨进程
+        # 互斥：多个 API 进程把数据目录指向同一共享卷时，创建/修订/绑定/
+        # 联动仍在跨进程意义上互斥，且提交前按磁盘签名同步，不会用旧缓存
+        # 覆盖其他进程刚保存的工作单。
+        self._rlock = threading.RLock()
+        self._file_lock = FileLock(os.path.join(data_dir, f".{STORE_FILENAME}.lock"))
         #: 工作单标识 -> 工作单当前修订记录
         self._sheets: dict[str, dict] = {}
         self._loaded = False
+        #: 上次加载/落盘时数据文件的磁盘签名（inode+mtime+大小）
+        self._disk_sig = None
 
     @property
     def path(self) -> str:
@@ -155,40 +171,83 @@ class RevisionStore:
 
         return self._path
 
+    def close(self) -> None:
+        """释放跨进程锁文件描述符（仅存储被丢弃前使用，主要供测试）。
+
+        刻意不获取 ``self._rlock``：操作路径的加锁顺序是
+        “FileLock 内部锁 -> self._rlock”，这里若反向嵌套会构成潜在死锁环。
+        调用方须确保此后不再有针对本存储实例的并发操作。
+        """
+
+        self._file_lock.close()
+
     def load(self) -> None:
-        """从数据目录加载全部可修订工作单；文件不存在时以空存储启动。
+        """从数据目录加载全部可修订工作单（启动期：无跨进程锁）。
+
+        进程启动时数据文件要么不存在，要么是上个进程的最终状态，因此这里
+        不加 ``flock``；运行期的重新加载统一走 :meth:`_sync_locked`
+        （在共享/排他锁内按磁盘签名同步）。
 
         文件存在但无法解析时抛出异常使启动失败（宁可不可用也不静默丢数据）。
         """
 
-        with self._lock:
-            if not os.path.exists(self._path):
-                self._sheets = {}
-                self._loaded = True
-                return
-            with open(self._path, encoding="utf-8") as f:
-                raw = json.load(f)
-            if not isinstance(raw, dict) or raw.get("version") != _STORE_VERSION:
-                raise ValueError(f"可修订工作单存储文件版本不被支持: {self._path}")
-            sheets = raw.get("sheets")
-            if not isinstance(sheets, dict):
-                raise ValueError(f"可修订工作单存储文件的 sheets 字段格式非法: {self._path}")
-            loaded: dict[str, dict] = {}
-            for sheet_id, record in sheets.items():
-                loaded[sheet_id] = self._validate_record(sheet_id, record)
-            # 绑定是两张记录之间的关联：若磁盘文件被外部破坏导致引用悬空
-            # （上游已不存在、步骤或同名变量缺失），丢弃该下游上的绑定信息
-            # 而不是让启动失败——该单退化为无关联工作单，仍可读取与修订。
-            self._repair_dangling_bindings_locked(loaded)
-            self._sheets = loaded
+        with self._rlock:
+            self._load_locked()
+
+    def _load_locked(self) -> None:
+        """实际读取并解析数据文件（调用方须持有进程内锁；不触碰 flock）。"""
+
+        if not os.path.exists(self._path):
+            self._sheets = {}
+            self._disk_sig = file_signature(self._path)
             self._loaded = True
+            return
+        with open(self._path, encoding="utf-8") as f:
+            raw = json.load(f)
+        if not isinstance(raw, dict) or raw.get("version") != _STORE_VERSION:
+            raise ValueError(f"可修订工作单存储文件版本不被支持: {self._path}")
+        sheets = raw.get("sheets")
+        if not isinstance(sheets, dict):
+            raise ValueError(f"可修订工作单存储文件的 sheets 字段格式非法: {self._path}")
+        loaded: dict[str, dict] = {}
+        for sheet_id, record in sheets.items():
+            loaded[sheet_id] = self._validate_record(sheet_id, record)
+        # 绑定是两张记录之间的关联：若磁盘文件被外部破坏导致引用悬空
+        # （上游已不存在、步骤或同名变量缺失），丢弃该下游上的绑定信息
+        # 而不是让启动失败——该单退化为无关联工作单，仍可读取与修订。
+        self._repair_dangling_bindings_locked(loaded)
+        self._sheets = loaded
+        self._disk_sig = file_signature(self._path)
+        self._loaded = True
+
+    def _sync_locked(self) -> None:
+        """在已持有跨进程锁时按磁盘签名同步本进程缓存（调用方须持两锁）。
+
+        数据文件自上次加载/落盘后被另一进程原子替换（inode/mtime 变化）
+        时，从磁盘重新加载；签名一致则缓存即最新，不重复解析。调用方已
+        持有共享/排他 flock，签名检查与随后的读取/写入之间不会有写者
+        插入——另一方创建的工作单在本进程下一次读/写时立即可见。
+
+        文件在磁盘上消失（应用自身从不删除数据文件，只可能是外部运维
+        误删）而本进程内存仍有已加载内容时，**不**把内存清空：否则随后的
+        写回事务会仅凭本进程缓存“复活”文件，而读事务会误报 404。保持
+        内存与旧签名继续服务，等文件重新出现（新 inode）再按磁盘重载。
+        """
+
+        sig = file_signature(self._path)
+        if sig is None:
+            return
+        if not self._loaded or sig != self._disk_sig:
+            self._load_locked()
 
     def count(self) -> int:
         """已保存的工作单数量（主要供测试与运维观察）。"""
 
         self._ensure_loaded()
-        with self._lock:
-            return len(self._sheets)
+        with self._file_lock.shared():
+            with self._rlock:
+                self._sync_locked()
+                return len(self._sheets)
 
     def _repair_dangling_bindings_locked(self, sheets: dict[str, dict]) -> None:
         """加载后丢弃悬空绑定（上游记录缺失或步骤/同名变量不再存在）。
@@ -213,16 +272,20 @@ class RevisionStore:
     def snapshot(self, worksheet_id: str) -> dict:
         """返回某工作单当前修订的**深拷贝**快照；不存在时抛出 404 领域错误。
 
-        深拷贝在锁内完成：并发修改/落盘不会改动调用方拿到的对象，读者
-        看到的必然是某一修订自洽的输入与结果。
+        跨进程读事务：先在共享锁内按磁盘签名同步——另一进程（或另一容器
+        副本）刚创建/修订/联动保存的内容在本进程立即可见。深拷贝在锁内
+        完成：并发修改/落盘不会改动调用方拿到的对象，读者看到的必然是某
+        一修订自洽的输入与结果。
         """
 
         self._ensure_loaded()
-        with self._lock:
-            record = self._sheets.get(worksheet_id)
-            if record is None:
-                raise RevisionNotFoundError(worksheet_id)
-            return deepcopy(record)
+        with self._file_lock.shared():
+            with self._rlock:
+                self._sync_locked()
+                record = self._sheets.get(worksheet_id)
+                if record is None:
+                    raise RevisionNotFoundError(worksheet_id)
+                return deepcopy(record)
 
     def create(
         self,
@@ -245,20 +308,24 @@ class RevisionStore:
             "results": [_dump_result(r) for r in results],
             "binding": None,
         }
-        with self._lock:
-            while True:
-                sheet_id = _ID_PREFIX + secrets.token_hex(_ID_BYTES)
-                if sheet_id not in self._sheets:
-                    break
-            self._sheets[sheet_id] = deepcopy(record)
-            try:
-                self._persist_locked()
-            except Exception:
-                # 写盘失败：创建不落任何痕迹，已保存内容保持原样
-                del self._sheets[sheet_id]
-                raise
-            record["id"] = sheet_id
-            return sheet_id, deepcopy(record)
+        with self._file_lock.exclusive():
+            with self._rlock:
+                # 同步其他进程已创建的工作单后再生成标识、写回，保证本单
+                # 不会把它们从共享文件中覆盖掉
+                self._sync_locked()
+                while True:
+                    sheet_id = _ID_PREFIX + secrets.token_hex(_ID_BYTES)
+                    if sheet_id not in self._sheets:
+                        break
+                self._sheets[sheet_id] = deepcopy(record)
+                try:
+                    self._persist_locked()
+                except Exception:
+                    # 写盘失败：创建不落任何痕迹，已保存内容保持原样
+                    del self._sheets[sheet_id]
+                    raise
+                record["id"] = sheet_id
+                return sheet_id, deepcopy(record)
 
     def bind_downstream(
         self,
@@ -291,62 +358,66 @@ class RevisionStore:
         """
 
         self._ensure_loaded()
-        with self._lock:
-            upstream = self._sheets.get(upstream_id)
-            if upstream is None:
-                raise RevisionNotFoundError(upstream_id)
-            if upstream["revision"] != expected_revision:
-                raise RevisionConflictError(
-                    upstream_id, upstream["revision"], expected_revision
-                )
-            # 一对一、非链式：任一单最多参与一条关联，且上游不能同时是下游
-            self._assert_bindable_locked(upstream_id)
+        with self._file_lock.exclusive():
+            with self._rlock:
+                # 进入跨进程临界区后先同步：CAS、一对一/非链式约束、上游
+                # 步骤结果全部以另一进程刚保存的最新修订为准
+                self._sync_locked()
+                upstream = self._sheets.get(upstream_id)
+                if upstream is None:
+                    raise RevisionNotFoundError(upstream_id)
+                if upstream["revision"] != expected_revision:
+                    raise RevisionConflictError(
+                        upstream_id, upstream["revision"], expected_revision
+                    )
+                # 一对一、非链式：任一单最多参与一条关联，且上游不能同时是下游
+                self._assert_bindable_locked(upstream_id)
 
-            upstream_step = next(
-                (s for s in upstream["worksheet"]["steps"] if s["name"] == step_name),
-                None,
-            )
-            if upstream_step is None:
-                raise _invalid_revision_request(
-                    f"上游工作单 {upstream_id!r} 不存在步骤结果 {step_name!r}："
-                    "只能绑定上游现有步骤的结果"
+                upstream_step = next(
+                    (s for s in upstream["worksheet"]["steps"] if s["name"] == step_name),
+                    None,
                 )
-            if step_name not in downstream_body.variables:
-                raise _invalid_revision_request(
-                    f"下游工作单必须包含与绑定步骤同名的初始变量 {step_name!r}，"
-                    "该变量的值与单位由上游步骤结果覆盖"
+                if upstream_step is None:
+                    raise _invalid_revision_request(
+                        f"上游工作单 {upstream_id!r} 不存在步骤结果 {step_name!r}："
+                        "只能绑定上游现有步骤的结果"
+                    )
+                if step_name not in downstream_body.variables:
+                    raise _invalid_revision_request(
+                        f"下游工作单必须包含与绑定步骤同名的初始变量 {step_name!r}，"
+                        "该变量的值与单位由上游步骤结果覆盖"
+                    )
+
+                downstream_request = self._build_downstream_request_locked(
+                    upstream, step_name, downstream_body
                 )
+                # 整单计算：失败抛 422，此时尚未写入任何关联或下游记录
+                results = recalculate(downstream_request)
 
-            downstream_request = self._build_downstream_request_locked(
-                upstream, step_name, downstream_body
-            )
-            # 整单计算：失败抛 422，此时尚未写入任何关联或下游记录
-            results = recalculate(downstream_request)
-
-            record = {
-                "revision": INITIAL_REVISION,
-                "custom_unit_set_id": upstream["custom_unit_set_id"],
-                "worksheet": _dump_body(downstream_request),
-                "results": [_dump_result(r) for r in results],
-                "binding": {
-                    "upstream_worksheet_id": upstream_id,
-                    "step_name": step_name,
-                    "upstream_revision": expected_revision,
-                },
-            }
-            while True:
-                downstream_id = _ID_PREFIX + secrets.token_hex(_ID_BYTES)
-                if downstream_id not in self._sheets:
-                    break
-            self._sheets[downstream_id] = deepcopy(record)
-            try:
-                self._persist_locked()
-            except Exception:
-                # 写盘失败：关联尚未写入上游、下游记录删除，两单都不变
-                del self._sheets[downstream_id]
-                raise
-            record["id"] = downstream_id
-            return downstream_id, deepcopy(record)
+                record = {
+                    "revision": INITIAL_REVISION,
+                    "custom_unit_set_id": upstream["custom_unit_set_id"],
+                    "worksheet": _dump_body(downstream_request),
+                    "results": [_dump_result(r) for r in results],
+                    "binding": {
+                        "upstream_worksheet_id": upstream_id,
+                        "step_name": step_name,
+                        "upstream_revision": expected_revision,
+                    },
+                }
+                while True:
+                    downstream_id = _ID_PREFIX + secrets.token_hex(_ID_BYTES)
+                    if downstream_id not in self._sheets:
+                        break
+                self._sheets[downstream_id] = deepcopy(record)
+                try:
+                    self._persist_locked()
+                except Exception:
+                    # 写盘失败：关联尚未写入上游、下游记录删除，两单都不变
+                    del self._sheets[downstream_id]
+                    raise
+                record["id"] = downstream_id
+                return downstream_id, deepcopy(record)
 
     def revise(
         self,
@@ -384,60 +455,67 @@ class RevisionStore:
         """
 
         self._ensure_loaded()
-        with self._lock:
-            record = self._sheets.get(worksheet_id)
-            if record is None:
-                raise RevisionNotFoundError(worksheet_id)
-            if record["revision"] != expected_revision:
-                raise RevisionConflictError(
-                    worksheet_id, record["revision"], expected_revision
-                )
-            # 下游不得直接修改被绑定的初始变量（422，先于任何计算与写入）
-            binding = record.get("binding")
-            if binding is not None and isinstance(change, VariableChange):
-                if change.name == binding["step_name"]:
-                    raise _invalid_revision_request(
-                        f"初始变量 {change.name!r} 已绑定上游工作单 "
-                        f"{binding['upstream_worksheet_id']!r} 的步骤 "
-                        f"{binding['step_name']!r} 的结果，不能直接修改："
-                        "请修订上游工作单以联动更新"
+        with self._file_lock.exclusive():
+            with self._rlock:
+                # 跨进程临界区：先按磁盘签名同步，CAS 判定针对的是另一进程
+                # 也可能刚推进过的当前修订号——跨进程同时提交同一
+                # expected_revision 时，后进入临界区的一方在此得到 409，
+                # 且 409 带回的是最新修订号；落选者不会参与落盘，因此其他
+                # 工作单也不会被任何一方的旧缓存覆盖。
+                self._sync_locked()
+                record = self._sheets.get(worksheet_id)
+                if record is None:
+                    raise RevisionNotFoundError(worksheet_id)
+                if record["revision"] != expected_revision:
+                    raise RevisionConflictError(
+                        worksheet_id, record["revision"], expected_revision
                     )
-            # 修改只作用于深拷贝并重新校验；此时 record 尚未被改动
-            changed_request = self._apply_change_locked(record, change)
-            # 整单重算：失败抛 422，record 仍保持原修订内容
-            results = recalculate(changed_request)
+                # 下游不得直接修改被绑定的初始变量（422，先于任何计算与写入）
+                binding = record.get("binding")
+                if binding is not None and isinstance(change, VariableChange):
+                    if change.name == binding["step_name"]:
+                        raise _invalid_revision_request(
+                            f"初始变量 {change.name!r} 已绑定上游工作单 "
+                            f"{binding['upstream_worksheet_id']!r} 的步骤 "
+                            f"{binding['step_name']!r} 的结果，不能直接修改："
+                            "请修订上游工作单以联动更新"
+                        )
+                # 修改只作用于深拷贝并重新校验；此时 record 尚未被改动
+                changed_request = self._apply_change_locked(record, change)
+                # 整单重算：失败抛 422，record 仍保持原修订内容
+                results = recalculate(changed_request)
 
-            # 上游联动：用新步骤结果覆盖下游绑定变量并整单重算。全部计算
-            # 先在深拷贝上完成，任一步失败抛 422，两单 record 均未被改动。
-            downstream_update = self._propagate_locked(
-                worksheet_id, expected_revision, results, recalculate
-            )
+                # 上游联动：用新步骤结果覆盖下游绑定变量并整单重算。全部计算
+                # 先在深拷贝上完成，任一步失败抛 422，两单 record 均未被改动。
+                downstream_update = self._propagate_locked(
+                    worksheet_id, expected_revision, results, recalculate
+                )
 
-            previous = {worksheet_id: deepcopy(record)}
-            record["revision"] = expected_revision + 1
-            record["worksheet"] = _dump_body(changed_request)
-            record["results"] = [_dump_result(r) for r in results]
-            if downstream_update is not None:
-                downstream_id, downstream_record, downstream_request, downstream_results = (
-                    downstream_update
-                )
-                previous[downstream_id] = deepcopy(downstream_record)
-                downstream_record["revision"] += 1
-                downstream_record["worksheet"] = _dump_body(downstream_request)
-                downstream_record["results"] = [
-                    _dump_result(r) for r in downstream_results
-                ]
-                downstream_record["binding"]["upstream_revision"] = (
-                    expected_revision + 1
-                )
-            try:
-                self._persist_locked()
-            except Exception:
-                # 写盘失败：回滚本次涉及的全部工作单，修订与落盘共同生效
-                for sheet_id, previous_record in previous.items():
-                    self._sheets[sheet_id] = previous_record
-                raise
-            return deepcopy(record)
+                previous = {worksheet_id: deepcopy(record)}
+                record["revision"] = expected_revision + 1
+                record["worksheet"] = _dump_body(changed_request)
+                record["results"] = [_dump_result(r) for r in results]
+                if downstream_update is not None:
+                    downstream_id, downstream_record, downstream_request, downstream_results = (
+                        downstream_update
+                    )
+                    previous[downstream_id] = deepcopy(downstream_record)
+                    downstream_record["revision"] += 1
+                    downstream_record["worksheet"] = _dump_body(downstream_request)
+                    downstream_record["results"] = [
+                        _dump_result(r) for r in downstream_results
+                    ]
+                    downstream_record["binding"]["upstream_revision"] = (
+                        expected_revision + 1
+                    )
+                try:
+                    self._persist_locked()
+                except Exception:
+                    # 写盘失败：回滚本次涉及的全部工作单，修订与落盘共同生效
+                    for sheet_id, previous_record in previous.items():
+                        self._sheets[sheet_id] = previous_record
+                    raise
+                return deepcopy(record)
 
     # -- 内部 -------------------------------------------------------------
 
@@ -683,7 +761,12 @@ class RevisionStore:
         }
 
     def _persist_locked(self) -> None:
-        """把全部工作单当前修订全量写入临时文件并原子替换（调用方须持锁）。"""
+        """把全部工作单当前修订全量写入临时文件并原子替换（调用方须持两锁）。
+
+        原子替换后数据文件 inode 改变：同步更新本进程缓存的磁盘签名，
+        下一次 :meth:`_sync_locked` 不会把自己刚写入的版本误判为其他进程
+        的新版本而重复加载。
+        """
 
         os.makedirs(self._data_dir, exist_ok=True)
         payload = {"version": _STORE_VERSION, "sheets": self._sheets}
@@ -693,6 +776,7 @@ class RevisionStore:
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp_path, self._path)
+        self._disk_sig = file_signature(self._path)
 
 
 def _dump_body(body: WorksheetBody) -> dict:
